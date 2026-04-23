@@ -1,38 +1,36 @@
-# GA-ePINN
+**A Geometry-Aware Energy-based PINN for Geometric Parametric Modeling in Computational Mechanics**
 
-GA-ePINN is a cleaned release-oriented repository for geometry-aware
-energy-based physics-informed neural networks in computational mechanics.
+**Abstract:** Existing Physics-Informed Neural Network (PINN) frameworks are geometry-specific, necessitating costly retraining for any alteration in the structural geometry. This repository incorporates a structure's geometric parameters as inputs to the model. Trained only once, it can solve for the deformation of any geometric configuration within a parametric domain. We term this framework the Geometry-Aware energy-based Physics-Informed Neural Network (GA-ePINN) and validate it through a series of numerical experiments on the Kirchhoff plate problem. Results show that in an aspect-ratio parameterization case, the GA-ePINN achieves computational efficiency more than 10 times greater than the Finite Element Method (FEM), while maintaining an average deflection error below 1%. In high-dimensional parameterization cases involving internal boundaries, the average deflection error is also kept within 3%. This approach leverages the intrinsic advantages of mesh-free methods and shows clear potential for high-dimensional problems.
 
-This repository focuses on publishable core code rather than the full research
-workspace. Training outputs, cached files, reviewer materials, and large
-experiment artifacts are intentionally excluded.
+This repository is a cleaned release version of the original GA-ePINN research workspace. It keeps the main publishable code, example entry points, and core visual assets, while excluding reviewer materials, cached files, training outputs, and other nonessential local artifacts.
 
-The current repository includes:
+<p align="center">
+  <img src="assets/Graphical_Abstract.png" alt="Graphical Abstract" width="640">
+</p>
 
-- 1D Euler-Bernoulli beam models
-- 2D Kirchhoff plate models
+<p align="center">
+  <img src="assets/Case1.png" alt="GA-ePINN Case 1" width="640">
+</p>
 
-## Animations
+<p align="center">
+  <img src="assets/Case2.gif" alt="GA-ePINN Case 2" width="640">
+</p>
 
-### Plate: parameterized moving-load response
+<p align="center">
+  <img src="assets/Case3A.gif" alt="GA-ePINN Case 3A" width="640">
+</p>
 
-![shell moving load](assets/shell_moving_P_2D.gif)
-
-### Beam: case 1
-
-![beam case1](assets/beam_case1.gif)
-
-### Beam: case 2
-
-![beam case2](assets/beam_case2.gif)
+<p align="center">
+  <img src="assets/Case3B.gif" alt="GA-ePINN Case 3B" width="640">
+</p>
 
 ## Included Problems
 
-- 1D beam bending with `cPINN`, `ePINN`, and `mlPINN` baselines
 - Parametric Kirchhoff plate with aspect-ratio variation
 - Plate with one hole and fixed plate length
 - Plate with one hole and geometric parameterization
 - Plate with two holes
+- 1D beam bending examples retained as supplementary cleaned code
 
 ## Repository Layout
 
@@ -44,12 +42,6 @@ GA-ePINN_clean/
     beam/
     plate/
 ```
-
-## Assets
-
-![Graphical Abstract](assets/Graphical_Abstract.png)
-
-![Case 1](assets/Case1.png)
 
 ## Installation
 
@@ -79,11 +71,6 @@ Outputs are written to `outputs/`.
 
 ## Notes
 
-- Some original evaluation utilities depended on local FEM spreadsheets that are
-  not bundled in this release repository.
-- Some FEM spreadsheets used for evaluation are not included because the files
-  are too large for the repository. If needed, they can be requested directly
-  from the author.
-- The release version keeps the main training code and minimal demonstration
-  entry points.
+- Some original evaluation workflows depended on local FEM spreadsheets that are not bundled in this release repository.
+- Some FEM spreadsheets used for evaluation are not included because the files are too large for the repository. If needed, they can be requested directly from the author.
 - The original research workspace remains preserved separately.
