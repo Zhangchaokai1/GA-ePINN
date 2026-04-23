@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gaepinn"
+version = "0.1.0"
+description = "Geometry-aware energy-based PINN for computational mechanics."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "matplotlib>=3.7",
+  "numpy>=1.24",
+  "openpyxl>=3.1",
+  "pandas>=2.0",
+  "scipy>=1.10",
+  "torch>=2.1",
+  "tqdm>=4.66",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

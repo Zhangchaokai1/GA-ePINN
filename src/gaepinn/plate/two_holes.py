@@ -1,0 +1,464 @@
+import torch
+import torch.nn as nn
+from torch.autograd import grad
+from torch.optim import Adam
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import qmc
+from tqdm import tqdm
+import time
+import os
+import json
+import datetime
+import math
+
+# --- Check GPU availability ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+
+class FeedForward(nn.Module):
+    def __init__(self, layers):
+        super().__init__()
+        modules = []
+        for i in range(len(layers) - 1):
+            modules.append(nn.Linear(layers[i], layers[i+1]))
+            nn.init.xavier_normal_(modules[-1].weight, gain=1.0)
+            nn.init.zeros_(modules[-1].bias)
+            if i < len(layers) - 2:
+                modules.append(nn.Tanh())
+        self.net = nn.Sequential(*modules)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class PINN:
+    def __init__(self, X, config):
+        self.model_type = config['model_type']
+        self.constraint_type = config['constraint_type']
+        self.hole_c = config["hole_c"]
+
+        # Fix plate length L
+        self.L_fixed = float(config.get('L_fixed', 2.5))
+        self.L_fixed_t = torch.tensor(self.L_fixed, dtype=torch.float32, device=device)
+
+        self.max_X = X.max(axis=0)
+        self.min_X = X.min(axis=0)
+
+        # --- Input data: eight dimensions (x, y, cx1, cy1, r1, cx2, cy2, r2) ---
+        self.x = torch.tensor(X[:, 0:1], dtype=torch.float32, device=device)
+        self.y = torch.tensor(X[:, 1:2], dtype=torch.float32, device=device)
+        self.cx1 = torch.tensor(X[:, 2:3], dtype=torch.float32, device=device)
+        self.cy1 = torch.tensor(X[:, 3:4], dtype=torch.float32, device=device)
+        self.r1  = torch.tensor(X[:, 4:5], dtype=torch.float32, device=device)
+        self.cx2 = torch.tensor(X[:, 5:6], dtype=torch.float32, device=device)
+        self.cy2 = torch.tensor(X[:, 6:7], dtype=torch.float32, device=device)
+        self.r2  = torch.tensor(X[:, 7:8], dtype=torch.float32, device=device)
+
+        # Physical constants 
+        self.q = 100.0
+        self.v = 0.0
+        self.E = 12000000.0
+        self.t = 0.01
+        self.D0 = (self.E * self.t**3) / (12.0 * (1 - self.v**2))
+        D_np = self.D0 * np.array([[1.0, self.v, 0.0],
+                                   [self.v, 1.0, 0.0],
+                                   [0.0, 0.0, (1 - self.v) / 2.0]])
+        self.D = torch.tensor(D_np, dtype=torch.float32, device=device)
+        
+        self.layers = config["layers"]
+        self.net = FeedForward(self.layers).to(device)
+        
+        params = list(self.net.parameters())
+        self.optimizer = Adam(params, lr=config['lr'])
+        self.lbfgs = optim.LBFGS(params,
+                                 lr=1.0,
+                                 max_iter=50,
+                                 max_eval=80,
+                                 history_size=100,
+                                 line_search_fn='strong_wolfe')
+        self.loss_c_log = []
+        self.loss_f_log = []
+
+    #  Normalization 
+    def normalize(self, inp):
+        min_X_t = torch.tensor(self.min_X, dtype=torch.float32, device=device)
+        max_X_t = torch.tensor(self.max_X, dtype=torch.float32, device=device)
+        return 2.0 * (inp - min_X_t) / (max_X_t - min_X_t + 1e-12) - 1.0
+
+    def net_forward(self, x, y, cx1, cy1, r1, cx2, cy2, r2):
+        # Concatenate all parameters and normalize
+        inp_params = torch.cat([x, y, cx1, cy1, r1, cx2, cy2, r2], dim=1)
+        inp_params_n = self.normalize(inp_params)
+        
+        # Outer boundary function (rectangle: x?[0,L], y?[0,1])
+        g_outer = x * (self.L_fixed_t - x) * y * (1.0 - y)
+        
+        # Inner boundary function for the two circular holes
+        g_inner1 = (x - cx1)**2 + (y - cy1)**2 - r1**2
+        g_inner2 = (x - cx2)**2 + (y - cy2)**2 - r2**2
+        
+        # Combine boundaries and square to enforce clamped conditions (u=0, du/dn=0)
+        if self.hole_c == "clamped":
+            boundary_func = (g_outer * g_inner1 * g_inner2)**2
+        elif self.hole_c == "supported":
+            # Two holes simply supported (softened), outer boundary clamped
+            boundary_func = g_outer * (g_outer)**2
+        elif self.hole_c == "free":
+            boundary_func = (g_outer)**2
+        else:
+            boundary_func = (g_outer * g_inner1 * g_inner2)**2
+
+        u = boundary_func * self.net(inp_params_n)
+        return u
+
+    def compute_derivatives(self, x, y, cx1, cy1, r1, cx2, cy2, r2):
+        x_clone = x.clone().detach().requires_grad_(True)
+        y_clone = y.clone().detach().requires_grad_(True)
+        cx1_c, cy1_c, r1_c = [t.clone().detach() for t in (cx1, cy1, r1)]
+        cx2_c, cy2_c, r2_c = [t.clone().detach() for t in (cx2, cy2, r2)]
+        u = self.net_forward(x_clone, y_clone, cx1_c, cy1_c, r1_c, cx2_c, cy2_c, r2_c)
+        ones_u = torch.ones_like(u)
+        u_x, u_y = grad(u, (x_clone, y_clone), grad_outputs=ones_u, create_graph=True)
+        u_xx = grad(u_x, x_clone, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+        u_yy = grad(u_y, y_clone, grad_outputs=torch.ones_like(u_y), create_graph=True)[0]
+        u_xy = grad(u_x, y_clone, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+        
+        return {'u': u, 'u_x': u_x, 'u_y': u_y, 'u_xx': u_xx, 'u_yy': u_yy, 'u_xy': u_xy}
+
+
+    def loss_terms(self):
+        derivs_f = self.compute_derivatives(self.x, self.y, self.cx1, self.cy1, self.r1, self.cx2, self.cy2, self.r2)
+        
+        u, u_xx, u_yy, u_xy = derivs_f['u'], derivs_f['u_xx'], derivs_f['u_yy'], derivs_f['u_xy']
+        k = torch.cat([-u_xx, -u_yy, -2.0 * u_xy], dim=1)
+        M = torch.matmul(k, self.D)
+        
+        strain_energy_density = 0.5 * torch.sum(M * k, dim=1, keepdim=True)
+        external_work_density = self.q * u
+        potential_energy_density = strain_energy_density - external_work_density
+        
+        # Monte Carlo area = L_fixed * 1 - ? (r1^2 + r2^2)
+        # Normalize per sample (mitigates extreme radii) using tensors
+        area_t = self.L_fixed_t - math.pi * (self.r1 * self.r1 + self.r2 * self.r2)
+        total_potential_energy = potential_energy_density / (area_t + 1e-12)
+        loss_f = total_potential_energy.mean()
+        return loss_f
+
+    # --- train / train_lbfgs  ---
+    def train(self, config):
+        epochs = config["epochs"]
+        print_every = config["print_every"]
+        for it in tqdm(range(epochs), desc="Adam Training"):
+            self.optimizer.zero_grad()
+            loss_f = self.loss_terms()
+            loss = loss_f
+            loss.backward()
+            self.optimizer.step()
+            self.loss_f_log.append(loss_f.item())  # Log Adam loss
+            if it % print_every == 0 or it == epochs - 1:
+                print(f'It: {it:d}, Loss_f: {loss_f.item():.3e}')
+
+    def train_lbfgs(self, config):
+        epochs = config["epochs_lbfgs"]
+        def closure():
+            self.lbfgs.zero_grad()
+            loss_f = self.loss_terms()
+            loss = loss_f
+            loss.backward()
+            return loss
+        for it in tqdm(range(epochs), desc="LBFGS Training"):
+            self.lbfgs.step(closure)
+            loss_f = self.loss_terms() # Recalculate for logging
+            self.loss_f_log.append(loss_f.item()) # Log LBFGS loss
+
+            if it % 1 == 0 or it == epochs - 1: 
+                 print(f'It(LBFGS): {it:d}, Loss_f: {loss_f.item():.3e}')
+
+    def predict(self, x_np, y_np, cx1_np, cy1_np, r1_np, cx2_np, cy2_np, r2_np):
+        self.net.eval()
+        x = torch.tensor(x_np, dtype=torch.float32, device=device, requires_grad=True)
+        y = torch.tensor(y_np, dtype=torch.float32, device=device, requires_grad=True)
+        cx1 = torch.tensor(cx1_np, dtype=torch.float32, device=device)
+        cy1 = torch.tensor(cy1_np, dtype=torch.float32, device=device)
+        r1  = torch.tensor(r1_np, dtype=torch.float32, device=device)
+        cx2 = torch.tensor(cx2_np, dtype=torch.float32, device=device)
+        cy2 = torch.tensor(cy2_np, dtype=torch.float32, device=device)
+        r2  = torch.tensor(r2_np, dtype=torch.float32, device=device)
+        
+        derivs = self.compute_derivatives(x, y, cx1, cy1, r1, cx2, cy2, r2)
+        u = derivs['u']
+        u_xx =  derivs['u_xx'];u_yy =  derivs['u_yy'];u_xy =  derivs['u_xy']
+        self.net.train()
+        return u.detach().cpu().numpy(),u_xx.detach().cpu().numpy(), u_yy.detach().cpu().numpy(),u_xy.detach().cpu().numpy()
+
+
+    def evaluate(self, cx1_test, cy1_test, r1_test, cx2_test, cy2_test, r2_test):
+        print(f"\n--- Evaluating for L={self.L_fixed}, (cx1,cy1,r1)=({cx1_test},{cy1_test},{r1_test}), (cx2,cy2,r2)=({cx2_test},{cy2_test},{r2_test}) ---")
+        # 1. Generate a grid for plotting
+        n_grid = 201
+        x_space = np.linspace(0, self.L_fixed, n_grid)
+        y_space = np.linspace(0, 1, n_grid)
+        x_grid, y_grid = np.meshgrid(x_space, y_space)
+        
+        x_flat = x_grid.flatten()
+        y_flat = y_grid.flatten()
+
+        # 2. Remove points inside both holes
+        dist1_sq = (x_flat - cx1_test)**2 + (y_flat - cy1_test)**2
+        dist2_sq = (x_flat - cx2_test)**2 + (y_flat - cy2_test)**2
+        valid_indices = (dist1_sq >= r1_test**2) & (dist2_sq >= r2_test**2)
+        
+        x_pred = x_flat[valid_indices][:, None]
+        y_pred = y_flat[valid_indices][:, None]
+        
+        # 3. Prepare model inputs
+        cx1_pred = np.full_like(x_pred, cx1_test)
+        cy1_pred = np.full_like(x_pred, cy1_test)
+        r1_pred  = np.full_like(x_pred, r1_test)
+        cx2_pred = np.full_like(x_pred, cx2_test)
+        cy2_pred = np.full_like(x_pred, cy2_test)
+        r2_pred  = np.full_like(x_pred, r2_test)
+
+        # 4. Use the PINN to predict displacements
+        u_pred,u_xx_pred,u_yy_pred,u_xy_pred = self.predict(x_pred, y_pred, cx1_pred, cy1_pred, r1_pred, cx2_pred, cy2_pred, r2_pred)
+        u_pred,u_xx_pred,u_yy_pred,u_xy_pred =u_pred.flatten(),u_xx_pred.flatten(),u_yy_pred.flatten(),u_xy_pred.flatten()
+
+        # # 5. Visualize u predictions
+        # plt.figure(figsize=(8, 5), dpi=150)
+        # plt.tricontourf(x_pred.flatten(), y_pred.flatten(), u_pred, levels=50, cmap='Spectral')
+        # cbar = plt.colorbar(); cbar.set_label('Predicted Deflection u(x, y)')
+        # ax = plt.gca()
+        # ax.add_artist(plt.Circle((cx1_test, cy1_test), r1_test, color='white', fill=True))
+        # ax.add_artist(plt.Circle((cx2_test, cy2_test), r2_test, color='white', fill=True))
+        # plt.xlabel('x'); plt.ylabel('y')
+        # plt.title(f'PINN Prediction for Plate with Two Holes\nL={self.L_fixed}')
+        # plt.axis('equal'); plt.tight_layout(); plt.show()
+
+        # # 6. Visualize u_xx predictions
+        # plt.figure(figsize=(8, 5), dpi=150)
+        # plt.tricontourf(x_pred.flatten(), y_pred.flatten(), u_xx_pred, levels=50, cmap='Spectral')
+        # cbar = plt.colorbar(); cbar.set_label('Predicted u_xx(x, y)')
+        # ax = plt.gca()
+        # ax.add_artist(plt.Circle((cx1_test, cy1_test), r1_test, color='white', fill=True))
+        # ax.add_artist(plt.Circle((cx2_test, cy2_test), r2_test, color='white', fill=True))
+        # plt.xlabel('x'); plt.ylabel('y')
+        # plt.title(f'PINN Prediction for Plate with Two Holes\nL={self.L_fixed}')
+        # plt.axis('equal'); plt.tight_layout(); plt.show()
+
+        # # 7. Visualize u_yy predictions
+        # plt.figure(figsize=(8, 5), dpi=150)
+        # plt.tricontourf(x_pred.flatten(), y_pred.flatten(), u_yy_pred, levels=50, cmap='Spectral')
+        # cbar = plt.colorbar(); cbar.set_label('Predicted u_yy(x, y)')
+        # ax = plt.gca()
+        # ax.add_artist(plt.Circle((cx1_test, cy1_test), r1_test, color='white', fill=True))
+        # ax.add_artist(plt.Circle((cx2_test, cy2_test), r2_test, color='white', fill=True))
+        # plt.xlabel('x'); plt.ylabel('y')
+        # plt.title(f'PINN Prediction for Plate with Two Holes\nL={self.L_fixed}')
+        # plt.axis('equal'); plt.tight_layout(); plt.show()
+
+        # # 8. Visualize u_xy predictions
+        # plt.figure(figsize=(8, 5), dpi=300)
+        # plt.tricontourf(x_pred.flatten(), y_pred.flatten(), u_xy_pred, levels=50, cmap='Spectral')
+        # cbar = plt.colorbar(); cbar.set_label('Predicted u_xy(x, y)')
+        # ax = plt.gca()
+        # ax.add_artist(plt.Circle((cx1_test, cy1_test), r1_test, color='white', fill=True))
+        # ax.add_artist(plt.Circle((cx2_test, cy2_test), r2_test, color='white', fill=True))
+        # plt.xlabel('x'); plt.ylabel('y')
+        # plt.title(f'PINN Prediction for Plate with Two Holes\nL={self.L_fixed}')
+        # plt.axis('equal'); plt.tight_layout(); plt.show()
+
+        return x_pred,y_pred,u_pred,-u_xx_pred,-u_yy_pred,-u_xy_pred
+
+
+def relative_l2_error(y_true, y_pred):
+    return np.sqrt(np.sum((y_pred - y_true) ** 2)) / np.sqrt(np.sum(y_true ** 2))
+
+
+def make_data_Sobol_plate_with_two_holes(config):
+    n_points_target = config["n_domain"]
+    L_fixed = float(config.get("L_fixed", 2.5))
+    cx1_rel_range = config["cx1_rel_range"]
+    cy1_range = config["cy1_range"]
+    r1_range  = config["r1_range"]
+    cx2_rel_range = config["cx2_rel_range"]
+    cy2_range = config["cy2_range"]
+    r2_range  = config["r2_range"]
+    
+    print("Generating collocation points with Sobol...")
+    
+    # Sobol sequence dimension d=8: (x_hat, y, cx1_rel, cy1, r1, cx2_rel, cy2, r2)
+    d = 8
+    sobol_engine = qmc.Sobol(d=d, scramble=True, seed=config['seed'])
+    
+    lower_bounds = [0, 0, cx1_rel_range[0], cy1_range[0], r1_range[0], cx2_rel_range[0], cy2_range[0], r2_range[0]]
+    upper_bounds = [1, 1, cx1_rel_range[1], cy1_range[1], r1_range[1], cx2_rel_range[1], cy2_range[1], r2_range[1]]
+
+    X_valid = []
+    
+    # Use acceptance-rejection sampling
+    n_generated = 0
+    n_to_sample_initially = int(n_points_target * 2.0) 
+    
+    with tqdm(total=n_points_target, desc="Accept-Reject Sampling") as pbar:
+        while len(X_valid) < n_points_target:
+            if n_generated % n_to_sample_initially == 0:
+                 uniform_samples = sobol_engine.random(n=n_to_sample_initially)
+                 X_scaled = qmc.scale(uniform_samples, lower_bounds, upper_bounds)
+            
+            idx_in_batch = n_generated % n_to_sample_initially
+            sample = X_scaled[idx_in_batch]
+
+            x_hat, y, cx1_rel, cy1, r1, cx2_rel, cy2, r2 = sample
+            
+            # Compute physical coordinates
+            x = x_hat * L_fixed
+            cx1 = cx1_rel * L_fixed
+            cx2 = cx2_rel * L_fixed
+            
+            # Acceptance test: is the point outside both holes?
+            if ((x - cx1)**2 + (y - cy1)**2 >= r1**2) and ((x - cx2)**2 + (y - cy2)**2 >= r2**2):
+                X_valid.append([x, y, cx1, cy1, r1, cx2, cy2, r2])
+                pbar.update(1)
+
+            n_generated += 1
+            if n_generated > n_points_target * 50: 
+                print("\nWarning: Rejection rate is very high. Check geometry ranges.")
+                break
+
+    print(f"\nValid Sobol points: {len(X_valid)}")
+    return np.array(X_valid)
+
+
+def make_data_Random_plate_with_two_holes(config):
+    """
+    Sample candidate points uniformly at random in parameter space,
+    keeping only those outside the two holes via acceptance-rejection.
+    """
+    n_points_target = config["n_domain"]
+    L_fixed = float(config.get("L_fixed", 2.5))
+    cx1_rel_range = config["cx1_rel_range"]
+    cy1_range = config["cy1_range"]
+    r1_range  = config["r1_range"]
+    cx2_rel_range = config["cx2_rel_range"]
+    cy2_range = config["cy2_range"]
+    r2_range  = config["r2_range"]
+
+    print("Generating collocation points with random sampling...")
+
+    rng = np.random.default_rng(config['seed'])
+
+    lower_bounds = [0, 0, cx1_rel_range[0], cy1_range[0], r1_range[0], cx2_rel_range[0], cy2_range[0], r2_range[0]]
+    upper_bounds = [1, 1, cx1_rel_range[1], cy1_range[1], r1_range[1], cx2_rel_range[1], cy2_range[1], r2_range[1]]
+
+    X_valid = []
+    n_generated = 0
+    n_to_sample_initially = int(n_points_target * 2.0)
+
+    with tqdm(total=n_points_target, desc="Accept-Reject Sampling (Random)") as pbar:
+        while len(X_valid) < n_points_target:
+            if n_generated % n_to_sample_initially == 0:
+                U = rng.random((n_to_sample_initially, 8))
+                X_scaled = qmc.scale(U, lower_bounds, upper_bounds)
+
+            idx_in_batch = n_generated % n_to_sample_initially
+            sample = X_scaled[idx_in_batch]
+
+            x_hat, y, cx1_rel, cy1, r1, cx2_rel, cy2, r2 = sample
+            x = x_hat * L_fixed
+            cx1 = cx1_rel * L_fixed
+            cx2 = cx2_rel * L_fixed
+
+            # Acceptance-rejection: keep only points outside both holes
+            if ((x - cx1)**2 + (y - cy1)**2 >= r1**2) and ((x - cx2)**2 + (y - cy2)**2 >= r2**2):
+                X_valid.append([x, y, cx1, cy1, r1, cx2, cy2, r2])
+                pbar.update(1)
+
+            n_generated += 1
+            if n_generated > n_points_target * 50:
+                print("\nWarning: Rejection rate is very high. Check geometry ranges.")
+                break
+
+    print(f"\nRandom samples retained {len(X_valid)}")
+    return np.array(X_valid)
+
+
+def main(config):
+    save_dir = config["save_dir"]
+    total_start = time.time()
+    # Sampling method
+    if config["sample_method"] =="make_data_Sobol_plate_with_two_holes":
+        X_star = make_data_Sobol_plate_with_two_holes(config)
+    if config["sample_method"] =="make_data_Random_plate_with_two_holes":
+        X_star = make_data_Random_plate_with_two_holes(config)
+
+    model = PINN(X_star, config)
+    
+    model.train(config)
+    model.train_lbfgs(config)
+    torch.save(model.net.state_dict(), os.path.join(save_dir, "model.pth"))
+    total_time = time.time()-total_start
+    print("Training time:", total_time)
+    config["total_time"] = total_time
+
+    # --- Save configuration and loss ---
+    config["min_X"] = model.min_X.tolist()
+    config["max_X"] = model.max_X.tolist()
+    with open(os.path.join(save_dir, "config.json"), 'w') as f:
+        json.dump(config, f, indent=4)
+    loss_df = pd.DataFrame({"loss_f": model.loss_f_log})
+    loss_df.to_csv(os.path.join(save_dir, "loss_log.csv"), index=False)
+    print(f"\nModel and logs saved to: {save_dir}")
+    
+    # Example evaluation
+    if config.get("run_eval", True):
+        model.evaluate(cx1_test=0.6, cy1_test=0.5, r1_test=0.15,
+                       cx2_test=1.8, cy2_test=0.5, r2_test=0.15)
+        model.evaluate(cx1_test=0.7, cy1_test=0.3, r1_test=0.1,
+                       cx2_test=1.9, cy2_test=0.7, r2_test=0.12)
+
+
+if __name__ == "__main__":
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    save_dir = os.path.join("results_two_holes", timestamp)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    config = {
+        "save_dir": save_dir,
+        "seed": 1234,  
+        "n_domain": 2**18, 
+        "sample_method" :"make_data_Sobol_plate_with_two_holes",
+
+        # Fixed plate length (no longer parameterized)
+        "L_fixed": 2.5,
+
+        # Independent parameter ranges for the two holes
+        "cx1_rel_range": (0.10, 0.90),
+        "cy1_range": (0.10, 0.90),
+        "r1_range": (0.01, 0.25),
+        "cx2_rel_range": (0.10, 0.90),
+        "cy2_range": (0.10, 0.90),
+        "r2_range": (0.01, 0.25),
+
+        "model_type": 'GAPINN',
+        "constraint_type": 'hard',
+        "hole_c":"clamped",  # clamped supported free
+
+        # Input layer has eight features (x, y, cx1, cy1, r1, cx2, cy2, r2)
+        "layers": [8] + 4*[50] + [1], 
+        
+        "epochs": 0, 
+        "epochs_lbfgs": 200,
+        "print_every": 10,
+        "lr": 1e-3, 
+    }
+    print("Config:", config)
+    
+    np.random.seed(config['seed'])
+    torch.manual_seed(config['seed'])
+    
+    main(config=config)
+    print("Config:", config)
