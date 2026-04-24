@@ -5,7 +5,7 @@
 This repository is a cleaned release version of the original GA-ePINN research workspace. It keeps the main publishable code, example entry points, and core visual assets, while excluding reviewer materials, cached files, training outputs, and other nonessential local artifacts.
 
 <p align="center">
-  <img src="assets/Graphical Abstract.tif" alt="Graphical Abstract" width="640">
+  <img src="assets/Graphical Abstract.svg" alt="Graphical Abstract" width="640">
 </p>
 
 <p align="center">
