@@ -7,7 +7,7 @@
 本仓库是原始 GA-ePINN 研究工作区的整理发布版本，保留了适合公开发布的主要代码、示例入口和核心可视化资源，同时移除了返修材料、缓存文件、训练输出以及其他不适合公开仓库保留的本地实验产物。
 
 <p align="center">
-  <img src="assets/Graphical_Abstract.png" alt="Graphical Abstract" width="640">
+  <img src="assets/Graphical Abstract.svg" alt="Graphical Abstract" width="640">
 </p>
 
 <p align="center">
