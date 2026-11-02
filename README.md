@@ -4,6 +4,11 @@
 
 This repository is a cleaned release version of the original GA-ePINN research workspace. It keeps the main publishable code, example entry points, and core visual assets, while excluding reviewer materials, cached files, training outputs, and other nonessential local artifacts.
 
+## Paper & Video
+
+- **Paper:** [Geometry-aware energy-based physics-informed neural network for geometric parametric modeling in computational mechanics](https://www.sciencedirect.com/science/article/pii/S0045794926001896), *Computers & Structures* (2026).
+- **Video:** [Watch on Bilibili](https://www.bilibili.com/video/BV19A4F6sEFf/)
+
 <p align="center">
   <img src="assets/Graphical Abstract.svg" alt="Graphical Abstract" width="640">
 </p>
